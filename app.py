@@ -29,6 +29,11 @@ from src.utils.visual_util import (
 )
 from src.utils.save_utils import save_camera_params, save_gs_ply, process_ply_to_splat, convert_gs_to_ply
 from src.utils.render_utils import render_interpolated_video
+from src.utils.erp_utils import (
+    is_erp_image, erp_to_cubemap, multi_erp_to_cubemap,
+    cubemap_views_to_model_input,
+    render_erp_from_splats, generate_horizontal_rotation_cameras,
+)
 import onnxruntime
 
 
@@ -110,10 +115,55 @@ def run_model(
     # Load images using WorldMirror's load_images function
     print("Loading images...")
     image_folder_path = os.path.join(target_dir, "images")
-    image_file_paths = [os.path.join(image_folder_path, path) for path in os.listdir(image_folder_path)]
-    img = load_and_preprocess_images(image_file_paths).to(device)
+    image_file_paths = sorted([os.path.join(image_folder_path, path) for path in os.listdir(image_folder_path)])
 
-    print(f"Loaded {img.shape[1]} images")
+    # ── ERP Detection ──
+    # Detect if any/all uploaded images are ERP panoramas (2:1 aspect ratio)
+    is_erp_input = False
+    cond_flags = [0, 0, 0]
+    erp_flags = [is_erp_image(p) for p in image_file_paths]
+    num_erp = sum(erp_flags)
+
+    if num_erp > 0 and num_erp == len(image_file_paths):
+        # All images are ERP panoramas
+        is_erp_input = True
+        n_erp = len(image_file_paths)
+        print(f"🌐 {n_erp} ERP panoramic image(s) detected, converting to cubemap perspectives...")
+
+        erp_images_np = []
+        erp_names = []
+        erp_faces_dir = os.path.join(target_dir, "erp_faces")
+        os.makedirs(erp_faces_dir, exist_ok=True)
+
+        for ei, erp_path in enumerate(image_file_paths):
+            pil = Image.open(erp_path).convert("RGB")
+            pil.save(os.path.join(target_dir, f"erp_original_{ei}.png"))
+            erp_images_np.append(np.array(pil))
+            erp_names.append(f"erp{ei}")
+
+        cubemap_views, group_sizes = multi_erp_to_cubemap(
+            erp_images_np, face_size=518, erp_names=erp_names,
+        )
+
+        new_image_paths = []
+        for v in cubemap_views:
+            face_path = os.path.join(erp_faces_dir, f"{v['name']}.png")
+            Image.fromarray(v['image']).save(face_path)
+            new_image_paths.append(face_path)
+        image_file_paths = new_image_paths
+        print(f"  ✅ Generated {len(cubemap_views)} cubemap faces ({n_erp} ERPs × {group_sizes[0]} faces)")
+
+        img, c2w_poses, K_intrs = cubemap_views_to_model_input(cubemap_views, device=device)
+        # Single ERP: full conditioning; Multi-ERP: intrinsics only
+        if n_erp == 1:
+            cond_flags = [1, 0, 1]
+        else:
+            cond_flags = [0, 0, 1]
+        print(f"  ✅ Camera conditioning: cond_flags={cond_flags}")
+    else:
+        img = load_and_preprocess_images(image_file_paths).to(device)
+
+    print(f"Loaded {img.shape[1]} images (ERP={is_erp_input})")
     if img.shape[1] == 0:
         raise ValueError("No images found. Check your upload.")
 
@@ -121,13 +171,19 @@ def run_model(
     print("Running inference...")
     inputs = {}
     inputs['img'] = img
+    if is_erp_input:
+        if n_erp == 1:
+            # Single ERP: provide both poses and intrinsics
+            inputs['camera_poses'] = c2w_poses
+        # Always provide intrinsics for ERP inputs
+        inputs['camera_intrs'] = K_intrs
     use_amp = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     if use_amp:
         amp_dtype = torch.bfloat16
     else:
         amp_dtype = torch.float32
     with torch.amp.autocast('cuda', enabled=bool(use_amp), dtype=amp_dtype):
-        predictions = model(inputs)
+        predictions = model(inputs, cond_flags=cond_flags)
 
     # img
     imgs = inputs["img"].permute(0, 1, 3, 4, 2)
@@ -160,7 +216,7 @@ def run_model(
         )
     skyseg_session = onnxruntime.InferenceSession("skyseg.onnx")
     sky_mask_list = []
-    for i, img_path in enumerate([os.path.join(image_folder_path, path) for path in os.listdir(image_folder_path)]):
+    for i, img_path in enumerate(image_file_paths):
         sky_mask = segment_sky(img_path, skyseg_session)
         # Resize mask to match H×W if needed
         if sky_mask.shape[0] != imgs.shape[1] or sky_mask.shape[1] != imgs.shape[2]:

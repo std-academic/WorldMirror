@@ -27,6 +27,13 @@ from src.models.utils.camera_utils import vector_to_camera_matrices
 from src.utils.geometry import depth_edge, normals_edge
 from src.utils.visual_util import segment_sky, download_file_from_url
 
+# ERP (equirectangular panorama) support
+from src.utils.erp_utils import (
+    is_erp_image, erp_to_cubemap, multi_erp_to_cubemap,
+    cubemap_views_to_model_input,
+    render_erp_from_splats, generate_horizontal_rotation_cameras,
+)
+
 
 def create_filter_mask(
     pts3d_conf: np.ndarray,
@@ -136,6 +143,15 @@ def main():
     parser.add_argument("--cond_pose", action="store_true", help="Use camera pose conditioning if available")
     parser.add_argument("--cond_intrinsics", action="store_true", help="Use intrinsics conditioning if available")
     parser.add_argument("--cond_depth", action="store_true", help="Use depth conditioning if available")
+    # ERP (equirectangular panorama) input support
+    parser.add_argument("--input_type", type=str, default="auto", choices=["auto", "perspective", "erp"],
+                        help="Input type: 'auto' detects ERP by 2:1 aspect ratio; 'erp' forces ERP processing; 'perspective' uses standard pipeline")
+    parser.add_argument("--save_erp_render", action="store_true", default=False,
+                        help="Render and save ERP panorama from reconstructed 3DGS (only for ERP input)")
+    parser.add_argument("--erp_render_height", type=int, default=1024,
+                        help="Height of rendered ERP panorama (width = 2x height)")
+    parser.add_argument("--erp_no_cond", action="store_true", default=False,
+                        help="Disable automatic camera conditioning for ERP mode (experimental)")
     args = parser.parse_args()
 
     # Print inference parameters
@@ -150,6 +166,10 @@ def main():
     print(f"    - Pose: {'✅' if args.cond_pose else '❌'}")
     print(f"    - Intrinsics: {'✅' if args.cond_intrinsics else '❌'}")
     print(f"    - Depth: {'✅' if args.cond_depth else '❌'}")
+    print(f"  - ERP:")
+    print(f"    - Input type: {args.input_type}")
+    print(f"    - Render ERP: {'✅' if args.save_erp_render else '❌'}")
+    print(f"    - ERP no cond: {'✅' if args.erp_no_cond else '❌'}")
 
     # 1) Init model - This requires internet access or the huggingface hub cache to be pre-downloaded
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -196,16 +216,91 @@ def main():
         img_paths = sorted(img_paths)
         print(f"✅ Loaded {len(img_paths)} images from {input_path}")
 
+    elif input_path.is_file() and input_path.suffix.lower() in ['.jpeg', '.jpg', '.png', '.webp', '.tiff', '.bmp']:
+        # Case 3: Single image file (may be ERP)
+        print(f"🖼️ Processing single image: {input_path}")
+        img_paths = [str(input_path)]
+        print(f"✅ Loaded 1 image")
+
     else:
         raise ValueError(f"❌ Invalid input path: {input_path}")
 
-    # 3) Load and preprocess images
+    # 3) Detect ERP and load/preprocess images
     views = {}
-    imgs = prepare_images_to_tensor(img_paths, target_size=args.target_size, resize_strategy="crop").to(device)  # [1,S,3,H,W], in [0,1]
-    views["img"] = imgs
+    is_erp_input = False
+
+    # Detect which images are ERP (2:1 aspect ratio)
+    erp_flags = [is_erp_image(p) for p in img_paths] if args.input_type != "perspective" else [False] * len(img_paths)
+    num_erp = sum(erp_flags)
+    force_erp = (args.input_type == "erp")
+
+    if force_erp or (args.input_type == "auto" and num_erp > 0 and num_erp == len(img_paths)):
+        # --- All inputs are ERP panoramas ---
+        is_erp_input = True
+        n_erp = len(img_paths)
+        print(f"\n🌐 {n_erp} ERP panoramic image(s) detected, converting to cubemap perspectives...")
+
+        # Load all ERP images
+        erp_images_np = []
+        erp_names = []
+        erp_faces_dir = outdir / "erp_faces"
+        erp_faces_dir.mkdir(exist_ok=True)
+
+        for ei, erp_path in enumerate(img_paths):
+            pil = Image.open(erp_path).convert("RGB")
+            pil.save(str(outdir / f"erp_original_{ei}.png"))
+            erp_images_np.append(np.array(pil))
+            erp_names.append(f"erp{ei}")
+
+        # Convert to cubemap faces
+        cubemap_views, group_sizes = multi_erp_to_cubemap(
+            erp_images_np, face_size=args.target_size, erp_names=erp_names,
+        )
+
+        img_paths = []  # Replace with cubemap face paths
+        for v in cubemap_views:
+            face_path = str(erp_faces_dir / f"{v['name']}.png")
+            Image.fromarray(v['image']).save(face_path)
+            img_paths.append(face_path)
+        print(f"  ✅ Generated {len(cubemap_views)} cubemap faces ({n_erp} ERPs × {group_sizes[0]} faces) → {erp_faces_dir}")
+
+        # Prepare model input with known camera parameters
+        imgs, c2w_poses, K_intrs = cubemap_views_to_model_input(cubemap_views, device=device)
+        views["img"] = imgs
+
+        # Camera conditioning strategy:
+        #   Single ERP  : full conditioning (pose + intrinsics) — all relative poses known
+        #   Multiple ERPs: intrinsics only — inter-panorama translations unknown
+        if not args.erp_no_cond:
+            views["camera_intrs"] = K_intrs
+            if n_erp == 1:
+                views["camera_poses"] = c2w_poses
+                cond_flags = [1, 0, 1]  # pose + intrinsics
+                print(f"  ✅ Camera conditioning: pose + intrinsics (single ERP, all poses known)")
+            else:
+                cond_flags = [0, 0, 1]  # intrinsics only
+                print(f"  ✅ Camera conditioning: intrinsics only (multi-ERP, inter-panorama poses unknown)")
+        else:
+            cond_flags = [0, 0, 0]
+            print(f"  ⚠️  Camera conditioning disabled (--erp_no_cond)")
+
+    else:
+        # Standard perspective image pipeline
+        imgs = prepare_images_to_tensor(img_paths, target_size=args.target_size, resize_strategy="crop").to(device)  # [1,S,3,H,W], in [0,1]
+        views["img"] = imgs
+        cond_flags = [0, 0, 0]
+
+    # Apply user-specified conditioning flags (can augment defaults)
+    if args.cond_pose:
+        cond_flags[0] = 1
+    if args.cond_depth:
+        cond_flags[1] = 1
+    if args.cond_intrinsics:
+        cond_flags[2] = 1
+
     B, S, C, H, W = imgs.shape
-    cond_flags = [0, 0, 0]
-    print(f"📸 Loaded {S} images with shape {imgs.shape}")
+    print(f"📸 Loaded {S} images with shape {imgs.shape} (ERP={is_erp_input})")
+    print(f"  - Effective cond_flags: {cond_flags}")
 
     # 4) Inference
     print("\n🚀 Starting inference pipeline...")
@@ -360,13 +455,14 @@ def main():
         )
 
         # Render video using the same filtered splats from predictions
+        # (For ERP input, a dedicated 360° rotation video is rendered later)
         num_views = S
-        if args.save_rendered:
+        if args.save_rendered and not is_erp_input:
             e4x4 = predictions['camera_poses']
             k3x3 = predictions['camera_intrs']
             render_interpolated_video(model.gs_renderer, predictions["splats"], e4x4, k3x3, (H, W), outdir / "rendered", interp_per_pair=15, loop_reverse=num_views==1)
             print(f"  - Saved rendered.mp4 to {outdir}")
-        else:
+        elif not is_erp_input:
             print(f"⚠️  Not set --save_rendered flag, skipping video rendering")
 
     # Build and export COLMAP reconstruction (images + sparse)
@@ -477,8 +573,38 @@ def main():
         save_points_ply(sparse_dir / "points3D.ply", f_pts, f_cols)
         
         print(f"  - Saved COLMAP BIN and points3D.ply to {sparse_dir}")
-        
-        
+
+    # ── ERP Panorama Rendering ──
+    if is_erp_input and args.save_erp_render and "splats" in predictions:
+        print(f"\n🌐 Rendering ERP panorama from reconstructed 3DGS...")
+        # For multi-ERP, render from the first panorama's viewpoint (origin)
+        erp_render = render_erp_from_splats(
+            model.gs_renderer,
+            predictions["splats"],
+            erp_h=args.erp_render_height,
+            erp_w=args.erp_render_height * 2,
+            face_size=args.target_size,
+        )
+        erp_rgb = (erp_render * 255).astype(np.uint8)
+        Image.fromarray(erp_rgb).save(str(outdir / "erp_render.png"))
+        print(f"  ✅ Saved ERP panorama to {outdir / 'erp_render.png'}")
+
+    # ── ERP 360° Rotation Video ──
+    if is_erp_input and args.save_rendered and "splats" in predictions:
+        print(f"\n🌐 Rendering 360° horizontal rotation video...")
+        rot_c2w, rot_K = generate_horizontal_rotation_cameras(
+            num_frames=120, fov=np.pi / 2, face_size=args.target_size, device=device,
+        )
+        render_interpolated_video(
+            model.gs_renderer, predictions["splats"],
+            rot_c2w, rot_K, (H, W),
+            outdir / "rendered_360",
+            interp_per_pair=1,
+            loop_reverse=False,
+        )
+        print(f"  ✅ Saved 360° rotation video to {outdir / 'rendered_360'}")
+
+
 if __name__ == "__main__":
     main()
 
