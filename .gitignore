@@ -8,3 +8,5 @@ skyseg.onnx
 logs/
 *.safetensors
 *.ckpt
+test_cubemap_output/
+output/

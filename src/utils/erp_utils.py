@@ -381,6 +381,75 @@ def _build_erp_to_cubemap_lut(
     return best_face, best_u.astype(np.float32), best_v.astype(np.float32)
 
 
+def _build_erp_to_cubemap_lut_blended(
+    erp_h: int,
+    erp_w: int,
+    face_size: int,
+    focal_length: float,
+    num_faces: int = 6,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Build a weighted LUT for multi-face blended ERP stitching.
+
+    Each ERP pixel may be covered by multiple cubemap faces (in the overlap
+    zone near edges). Instead of hard-selecting the single best face, this
+    LUT records the projection coordinates and a cos-based weight for *every*
+    covering face, enabling smooth cross-face blending.
+
+    The weight for each face is based on the camera-space z of the ray
+    direction, which equals cos(angle_from_optical_axis). Pixels near the
+    face centre (z→1) get high weight; pixels near the edge (z→0) fade out.
+
+    Returns:
+        face_weights: [num_faces, erp_h, erp_w] float32 – per-face blending weight (0 where invalid)
+        face_u:       [num_faces, erp_h, erp_w] float32 – u coord within each face (0 where invalid)
+        face_v:       [num_faces, erp_h, erp_w] float32 – v coord within each face (0 where invalid)
+        weight_sum:   [erp_h, erp_w] float32             – sum of weights for normalisation
+    """
+    u_erp = np.arange(erp_w, dtype=np.float64)
+    v_erp = np.arange(erp_h, dtype=np.float64)
+    u_erp, v_erp = np.meshgrid(u_erp, v_erp)
+
+    theta = (u_erp / erp_w) * 2.0 * np.pi - np.pi
+    phi = (0.5 - v_erp / erp_h) * np.pi
+
+    x = np.cos(phi) * np.sin(theta)
+    y = -np.sin(phi)
+    z = np.cos(phi) * np.cos(theta)
+    dirs = np.stack([x, y, z], axis=-1)
+
+    face_rotations = list(CUBEMAP_FACES.values())
+    cx = cy = face_size / 2.0
+
+    face_weights = np.zeros((num_faces, erp_h, erp_w), dtype=np.float32)
+    face_u_all = np.zeros((num_faces, erp_h, erp_w), dtype=np.float32)
+    face_v_all = np.zeros((num_faces, erp_h, erp_w), dtype=np.float32)
+
+    for fi, R_c2w in enumerate(face_rotations):
+        R_w2c = R_c2w.T
+        dirs_cam = dirs @ R_w2c.T
+
+        z_cam = dirs_cam[..., 2]
+        valid = z_cam > 0.01
+
+        u_px = dirs_cam[..., 0] / np.maximum(z_cam, 1e-8) * focal_length + cx
+        v_px = dirs_cam[..., 1] / np.maximum(z_cam, 1e-8) * focal_length + cy
+
+        in_bounds = valid & (u_px >= 0) & (u_px < face_size) & (v_px >= 0) & (v_px < face_size)
+
+        # Weight = z_cam (cosine of angle from optical axis), clipped to [0,1]
+        w = np.clip(z_cam, 0.0, 1.0).astype(np.float32)
+        w[~in_bounds] = 0.0
+
+        face_weights[fi] = w
+        face_u_all[fi] = np.where(in_bounds, u_px, 0.0).astype(np.float32)
+        face_v_all[fi] = np.where(in_bounds, v_px, 0.0).astype(np.float32)
+
+    weight_sum = face_weights.sum(axis=0)
+
+    return face_weights, face_u_all, face_v_all, weight_sum
+
+
 def render_erp_from_splats(
     gs_renderer,
     splats: Dict,
@@ -461,18 +530,21 @@ def render_erp_from_splats(
     # rendered_colors: [6, face_size, face_size, 3]
     face_images = rendered_colors.detach().cpu().numpy()
 
-    # Build ERP ← cubemap LUT and stitch
-    face_idx, face_u, face_v = _build_erp_to_cubemap_lut(erp_h, erp_w, face_size, f)
+    # Build blended ERP ← cubemap LUT and stitch with cosine-weighted blending
+    face_weights, face_u_all, face_v_all, weight_sum = _build_erp_to_cubemap_lut_blended(
+        erp_h, erp_w, face_size, f,
+    )
 
     erp = np.zeros((erp_h, erp_w, 3), dtype=np.float32)
 
     for fi in range(6):
-        mask = face_idx == fi
+        w = face_weights[fi]             # [erp_h, erp_w]
+        mask = w > 0
         if not mask.any():
             continue
 
-        u_coords = np.clip(face_u[mask], 0, face_size - 1.001)
-        v_coords = np.clip(face_v[mask], 0, face_size - 1.001)
+        u_coords = np.clip(face_u_all[fi][mask], 0, face_size - 1.001)
+        v_coords = np.clip(face_v_all[fi][mask], 0, face_size - 1.001)
 
         # Bilinear interpolation within the face
         u0 = np.floor(u_coords).astype(np.int32)
@@ -483,12 +555,19 @@ def render_erp_from_splats(
         dv = (v_coords - v0)[:, None]
 
         img = face_images[fi]
-        erp[mask] = (
+        sampled = (
             img[v0, u0] * (1 - du) * (1 - dv) +
             img[v0, u1] * du * (1 - dv) +
             img[v1, u0] * (1 - du) * dv +
             img[v1, u1] * du * dv
         )
+
+        # Weighted accumulation
+        erp[mask] += sampled * w[mask][:, None]
+
+    # Normalize by total weight
+    safe_ws = np.maximum(weight_sum, 1e-8)[:, :, None]
+    erp = erp / safe_ws
 
     return np.clip(erp, 0.0, 1.0)
 
