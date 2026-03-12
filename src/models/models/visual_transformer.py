@@ -193,7 +193,7 @@ class VisualGeometryTransformer(nn.Module):
         else:
             raise NotImplementedError
         
-        # Ray direction embedding
+        # Ray direction embedding (global intrinsics summary: fx, fy, cx, cy → 1 token)
         if self.cond_methods[2] == "token":
             self.ray_embed = nn.Sequential(
                 nn.Linear(4, embed_dim, bias=True),
@@ -202,6 +202,14 @@ class VisualGeometryTransformer(nn.Module):
             )
         else:
             raise NotImplementedError
+
+        # Spherical ray direction embedding (patch-wise: 2-channel θ,φ map → P tokens)
+        # This gives each patch its world-space viewing direction, enabling the model
+        # to understand spatial correspondence across cubemap faces in global attention.
+        self.spherical_ray_embed = self._init_patch_embedding_module(
+            "conv+mlp", img_size, patch_size, num_reg_tokens,
+            embed_dim=embed_dim, in_chans=2
+        )
 
     def _init_rotary_position_embedding(self, rope_freq):
         self.rope = RotaryPositionEmbedding2D(
@@ -251,18 +259,34 @@ class VisualGeometryTransformer(nn.Module):
         """
         Args:
             images: Input images with shape [B, S, 3, H, W], in range [0, 1]
-            priors: Optional tuple of (depth, rays, poses) for conditioning
-            cond_flags: List indicating which conditions to use [pose, depth, rays]
+            priors: Optional tuple of (depth, rays, poses, spherical_rays) for conditioning.
+                    spherical_rays is optional (can be None or omitted for backward compat).
+            cond_flags: List indicating which conditions to use [pose, depth, rays, spherical_rays].
+                        Length 3 or 4. If length 3, spherical_rays flag defaults to 0.
             ctx_frames: Number of context frames to use
 
         Returns:
             (list[torch.Tensor], int): List of attention block outputs and patch_start_idx
         """
-        depth_maps, ray_dirs, poses = priors if priors is not None else (None, None, None)
+        # Unpack priors with backward compatibility (3 or 4 elements)
+        if priors is not None:
+            priors = tuple(priors)
+            if len(priors) == 3:
+                depth_maps, ray_dirs, poses = priors
+                spherical_rays = None
+            else:
+                depth_maps, ray_dirs, poses, spherical_rays = priors
+        else:
+            depth_maps = ray_dirs = poses = spherical_rays = None
+
+        # Normalize cond_flags to length 4
+        cond_flags = list(cond_flags)
+        if len(cond_flags) == 3:
+            cond_flags.append(0)
 
         # Slice to context frames if specified
         if ctx_frames is not None:
-            for var_name in ['images', 'depth_maps', 'ray_dirs', 'poses']:
+            for var_name in ['images', 'depth_maps', 'ray_dirs', 'poses', 'spherical_rays']:
                 var = locals()[var_name]
                 if var is not None:
                     locals()[var_name] = var[:, :ctx_frames].clone()
@@ -287,9 +311,12 @@ class VisualGeometryTransformer(nn.Module):
 
         # Process all tokens (optional conditioning)
         if self.enable_cond:
-            pose_tokens, depth_tokens, ray_tokens = self._process_conditioning(depth_maps, ray_dirs, poses, b, seq_len, patch_count, embed_dim, images, cond_flags)
-            # Add condition tokens to patch tokens
-            patch_tokens = patch_tokens + depth_tokens
+            pose_tokens, depth_tokens, ray_tokens, sph_ray_tokens = self._process_conditioning(
+                depth_maps, ray_dirs, poses, spherical_rays,
+                b, seq_len, patch_count, embed_dim, images, cond_flags,
+            )
+            # Add patch-level condition tokens to patch tokens (additive)
+            patch_tokens = patch_tokens + depth_tokens + sph_ray_tokens
             all_tokens = torch.cat([cam_tokens, reg_tokens, pose_tokens, ray_tokens, patch_tokens], dim=1) 
         else:
             all_tokens = torch.cat([cam_tokens, reg_tokens, patch_tokens], dim=1)
@@ -340,11 +367,31 @@ class VisualGeometryTransformer(nn.Module):
 
         return outputs, self.patch_start_idx
 
-    def _process_conditioning(self, depth_maps, ray_dirs, poses, b, seq_len, patch_count, embed_dim, images, cond_flags):
-        """Process conditioning inputs."""
+    def _process_conditioning(self, depth_maps, ray_dirs, poses, spherical_rays,
+                              b, seq_len, patch_count, embed_dim, images, cond_flags):
+        """Process conditioning inputs.
+        
+        Args:
+            depth_maps: [B, S, H, W] normalized depth maps, or None.
+            ray_dirs: [B, S, 4] intrinsics summary (fx, fy, cx, cy), or None.
+            poses: [B, S, 7] camera pose vectors, or None.
+            spherical_rays: [B, S, 2, H, W] per-pixel (θ, φ) in world space, or None.
+            b: Batch size.
+            seq_len: Number of frames.
+            patch_count: Number of patch tokens per frame (before special tokens).
+            embed_dim: Token embedding dimension.
+            images: [B*S, C, H, W] preprocessed images (for shape/device reference).
+            cond_flags: [pose, depth, rays, spherical_rays] list of 0/1 flags.
+        
+        Returns:
+            pose_tokens: [B*S, 1, C] global pose token.
+            depth_tokens: [B*S, P, C] patch-level depth tokens.
+            ray_tokens: [B*S, 1, C] global intrinsics token.
+            sph_ray_tokens: [B*S, P, C] patch-level spherical ray tokens.
+        """
         h, w = images.shape[-2:]
         
-        # Process camera pose embedding
+        # Process camera pose embedding → 1 global token per frame
         use_poses = (cond_flags[0] == 1 and poses is not None)
         if use_poses:
             poses = poses.reshape(b*seq_len, -1)
@@ -352,7 +399,7 @@ class VisualGeometryTransformer(nn.Module):
         else:
             pose_tokens = torch.zeros((b*seq_len, 1, embed_dim), device=images.device, dtype=images.dtype)
 
-        # Process depth map embedding
+        # Process depth map embedding → P patch tokens per frame (additive)
         use_depth = cond_flags[1] == 1 and depth_maps is not None
         if use_depth:
             depth_maps = depth_maps.reshape(b*seq_len, 1, h, w)
@@ -360,15 +407,25 @@ class VisualGeometryTransformer(nn.Module):
         else:
             depth_tokens = torch.zeros((b*seq_len, patch_count, embed_dim), device=images.device, dtype=images.dtype)
 
-        # Process ray direction embedding
+        # Process ray direction embedding → 1 global token per frame
         use_rays = cond_flags[2] == 1 and ray_dirs is not None
         if use_rays:
             ray_dirs = ray_dirs.reshape(b*seq_len, -1)
             ray_tokens = self.ray_embed(ray_dirs).unsqueeze(1)
         else:
             ray_tokens = torch.zeros((b*seq_len, 1, embed_dim), device=images.device, dtype=images.dtype)
+
+        # Process spherical ray direction maps → P patch tokens per frame (additive)
+        # This encodes the world-space viewing direction (θ, φ) for each patch,
+        # enabling cross-face spatial correspondence in global attention.
+        use_sph = cond_flags[3] == 1 and spherical_rays is not None
+        if use_sph:
+            sph = spherical_rays.reshape(b*seq_len, 2, h, w)
+            sph_ray_tokens = self.spherical_ray_embed(sph).reshape(b * seq_len, patch_count, embed_dim)
+        else:
+            sph_ray_tokens = torch.zeros((b*seq_len, patch_count, embed_dim), device=images.device, dtype=images.dtype)
         
-        return pose_tokens, depth_tokens, ray_tokens
+        return pose_tokens, depth_tokens, ray_tokens, sph_ray_tokens
 
     def _process_attention_blocks(self, tokens, b, seq_len, patch_count, embed_dim, block_idx, blocks, block_type, pos=None):
         """Process attention blocks with tokens in shape (B*S, P, C)."""

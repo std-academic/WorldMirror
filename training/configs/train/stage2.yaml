@@ -7,6 +7,9 @@ slurm_job_id: 99999 # must set in the command line
 wrapper:
   eval_modalities: ["nvs"]
   enable_cond: true
+  cond_sampling_strategy: "custom"
+  # cond_flags order: [pose, depth, intrinsics, spherical_rays]
+  cond_sampling_probs: [0.2, 0.0, 1.0, 1.0]
   model:
     enable_cam: true
     enable_pts: true

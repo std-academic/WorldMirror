@@ -296,7 +296,7 @@ class WorldMirrorWrapper(LightningModule):
         # forward pass with condition flags
         if self.enable_cond:
             if self.cond_sampling_strategy == "uniform":
-                cond_flags = [random.randint(0, 1) for _ in range(3)]
+                cond_flags = [random.randint(0, 1) for _ in range(4)]
             elif self.cond_sampling_strategy == "custom":
                 assert (
                     self.cond_sampling_probs is not None
@@ -309,7 +309,7 @@ class WorldMirrorWrapper(LightningModule):
                     f"Unsupported sampling strategy: {self.cond_sampling_strategy}"
                 )
         else:
-            cond_flags = [0, 0, 0]
+            cond_flags = [0, 0, 0, 0]
 
         preds = self.forward(batched_inputs, cond_flags=cond_flags)
 
@@ -399,22 +399,24 @@ class WorldMirrorWrapper(LightningModule):
 
         # forward pass with optional conditions
         preds_all = {}
-        preds_all["nocond"] = self.forward(batched_inputs, cond_flags=[0, 0, 0])
+        preds_all["nocond"] = self.forward(batched_inputs, cond_flags=[0, 0, 0, 0])
         if self.enable_cond:
             if "camera_poses" in batched_inputs:
-                preds_all["wcam"] = self.forward(batched_inputs, cond_flags=[1, 0, 0])
+                preds_all["wcam"] = self.forward(batched_inputs, cond_flags=[1, 0, 0, 0])
             if "depthmap" in batched_inputs:
-                preds_all["wdepth"] = self.forward(batched_inputs, cond_flags=[0, 1, 0])
+                preds_all["wdepth"] = self.forward(batched_inputs, cond_flags=[0, 1, 0, 0])
             if "camera_intrs" in batched_inputs:
-                preds_all["wintrs"] = self.forward(batched_inputs, cond_flags=[0, 0, 1])
+                preds_all["wintrs"] = self.forward(batched_inputs, cond_flags=[0, 0, 1, 0])
+            if "camera_poses" in batched_inputs and "camera_intrs" in batched_inputs:
+                preds_all["wsph"] = self.forward(batched_inputs, cond_flags=[0, 0, 1, 1])
             if "camera_poses" in batched_inputs and "camera_intrs" in batched_inputs:
                 if "depthmap" in batched_inputs:
                     preds_all["wall"] = self.forward(
-                        batched_inputs, cond_flags=[1, 1, 1]
+                        batched_inputs, cond_flags=[1, 1, 1, 0]
                     )
                 else:
                     preds_all["wcam_wpose"] = self.forward(
-                        batched_inputs, cond_flags=[1, 0, 1]
+                        batched_inputs, cond_flags=[1, 0, 1, 0]
                     )
 
         dataset = batched_inputs["dataset"][0]

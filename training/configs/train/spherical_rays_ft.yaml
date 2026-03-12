@@ -1,0 +1,53 @@
+# @package _global_
+
+# Fine-tune config for patch-wise spherical ray tokens
+# Usage:
+#   python training/launch.py +train=spherical_rays_ft
+
+
+task_name: spherical_rays_ft
+tags: ["train", "spherical_rays", "finetune"]
+
+wrapper:
+  enable_cond: true
+  cond_sampling_strategy: "custom"
+  # cond_flags order: [pose, depth, intrinsics, spherical_rays]
+  # Prefer intrinsics + spherical rays, occasionally pose.
+  cond_sampling_probs: [0.2, 0.0, 1.0, 1.0]
+
+  optimizer:
+    # Freeze most of the backbone to keep training lightweight
+    freeze_params:
+      - "visual_geometry_transformer"
+      - "cam_head"
+      - "pts_head"
+      - "depth_head"
+      - "norm_head"
+      - "gs_head"
+      - "gs_renderer"
+
+    # Unfreeze spherical_ray_embed + (optional) ray/depth embeds for stability
+    new_params:
+      - "visual_geometry_transformer.spherical_ray_embed"
+      - "visual_geometry_transformer.ray_embed"
+      - "visual_geometry_transformer.depth_embed"
+
+    # Keep param_groups; use a higher LR for new modules
+    param_groups:
+      pretrained:
+        lr: 2e-5
+        weight_decay: 0.1
+      backbone:
+        lr: 1e-4
+        weight_decay: 0.1
+      new:
+        lr: 2e-4
+        weight_decay: 0.1
+
+trainer:
+  max_steps: 20000
+  val_check_interval: 2000
+  num_sanity_val_steps: 0
+
+# Data settings can be overridden externally if needed
+# e.g. +data.max_images_per_gpu=12

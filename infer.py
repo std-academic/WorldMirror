@@ -267,6 +267,7 @@ def main():
         # Prepare model input with known camera parameters
         imgs, c2w_poses, K_intrs = cubemap_views_to_model_input(cubemap_views, device=device)
         views["img"] = imgs
+        views["camera_poses"] = c2w_poses
 
         # Camera conditioning strategy:
         #   Single ERP  : full conditioning (pose + intrinsics) — all relative poses known
@@ -274,21 +275,20 @@ def main():
         if not args.erp_no_cond:
             views["camera_intrs"] = K_intrs
             if n_erp == 1:
-                views["camera_poses"] = c2w_poses
-                cond_flags = [1, 0, 1]  # pose + intrinsics
-                print(f"  ✅ Camera conditioning: pose + intrinsics (single ERP, all poses known)")
+                cond_flags = [1, 0, 1, 1]  # pose + intrinsics + spherical rays
+                print(f"  ✅ Camera conditioning: pose + intrinsics + spherical rays (single ERP)")
             else:
-                cond_flags = [0, 0, 1]  # intrinsics only
-                print(f"  ✅ Camera conditioning: intrinsics only (multi-ERP, inter-panorama poses unknown)")
+                cond_flags = [0, 0, 1, 1]  # intrinsics + spherical rays
+                print(f"  ✅ Camera conditioning: intrinsics + spherical rays (multi-ERP)")
         else:
-            cond_flags = [0, 0, 0]
+            cond_flags = [0, 0, 0, 0]
             print(f"  ⚠️  Camera conditioning disabled (--erp_no_cond)")
 
     else:
         # Standard perspective image pipeline
         imgs = prepare_images_to_tensor(img_paths, target_size=args.target_size, resize_strategy="crop").to(device)  # [1,S,3,H,W], in [0,1]
         views["img"] = imgs
-        cond_flags = [0, 0, 0]
+        cond_flags = [0, 0, 0, 0]
 
     # Apply user-specified conditioning flags (can augment defaults)
     if args.cond_pose:

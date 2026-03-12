@@ -259,15 +259,97 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                     import pdb; pdb.set_trace()
             depths = normalize_depth(depths)  # Shape: [B, S, H, W]
             
-        # Extract ray directions
+        # Extract ray directions (intrinsics summary)
         if 'camera_intrs' in views:
             intrinsics = views['camera_intrs'][:, :, :3, :3]
             fx, fy = intrinsics[:, :, 0, 0] / w, intrinsics[:, :, 1, 1] / h
             cx, cy = intrinsics[:, :, 0, 2] / w, intrinsics[:, :, 1, 2] / h
             rays = torch.stack([fx, fy, cx, cy], dim=-1)  # Shape: [B, S, 4]
 
-        return (depths, rays, poses)
+        # Compute patch-wise spherical ray direction maps for cross-view spatial awareness
+        # Each pixel gets (θ, φ) in world space; this helps the model understand
+        # which patches across different cubemap faces correspond to the same 3D direction.
+        spherical_rays = None
+        if 'camera_intrs' in views and 'camera_poses' in views:
+            spherical_rays = self._compute_spherical_ray_maps(
+                views['camera_intrs'], views['camera_poses'], h, w
+            )  # Shape: [B, S, 2, H, W]
+
+        return (depths, rays, poses, spherical_rays)
     
+    @staticmethod
+    def _compute_spherical_ray_maps(camera_intrs, camera_poses, h, w):
+        """
+        Compute per-pixel spherical ray direction maps (θ, φ) in world space.
+
+        For each pixel (u, v), we:
+          1. Compute the camera-space ray direction via pinhole unprojection.
+          2. Rotate to world space using the camera-to-world rotation.
+          3. Convert to spherical coordinates (θ=longitude, φ=latitude).
+          4. Normalize to [-1, 1] range for stable embedding.
+
+        Args:
+            camera_intrs: [B, S, 3, 3] intrinsic matrices.
+            camera_poses: [B, S, 4, 4] camera-to-world extrinsic matrices.
+            h, w: Image height and width in pixels.
+
+        Returns:
+            spherical_maps: [B, S, 2, H, W] where channel 0 = θ/π, channel 1 = φ/(π/2).
+                            Both in [-1, 1].
+        """
+        B, S = camera_intrs.shape[:2]
+        device = camera_intrs.device
+        dtype = camera_intrs.dtype
+
+        # Build pixel grid [H, W]
+        v_coords, u_coords = torch.meshgrid(
+            torch.arange(h, device=device, dtype=dtype),
+            torch.arange(w, device=device, dtype=dtype),
+            indexing='ij',
+        )  # both [H, W]
+
+        # Unproject to camera-space rays: [H, W, 3]
+        # For each frame, use its own intrinsics
+        fx = camera_intrs[:, :, 0, 0]  # [B, S]
+        fy = camera_intrs[:, :, 1, 1]
+        cx = camera_intrs[:, :, 0, 2]
+        cy = camera_intrs[:, :, 1, 2]
+
+        # Expand pixel grid for batch: [1, 1, H, W]
+        u = u_coords.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+        v = v_coords.unsqueeze(0).unsqueeze(0)
+
+        # Camera-space ray directions: [B, S, H, W, 3]
+        dirs_x = (u - cx[:, :, None, None]) / fx[:, :, None, None].clamp(min=1e-6)
+        dirs_y = (v - cy[:, :, None, None]) / fy[:, :, None, None].clamp(min=1e-6)
+        dirs_z = torch.ones(B, S, h, w, device=device, dtype=dtype)
+        dirs_cam = torch.stack([dirs_x, dirs_y, dirs_z], dim=-1)  # [B, S, H, W, 3]
+
+        # Normalize to unit vectors
+        dirs_cam = dirs_cam / dirs_cam.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+        # Rotate to world space using C2W rotation
+        R_c2w = camera_poses[:, :, :3, :3]  # [B, S, 3, 3]
+        # dirs_cam: [B, S, H, W, 3] → [B, S, H*W, 3]
+        dirs_flat = dirs_cam.reshape(B, S, h * w, 3)
+        # Batched matmul: [B, S, H*W, 3] @ [B, S, 3, 3]^T → [B, S, H*W, 3]
+        dirs_world = torch.einsum('bsnc,bsdc->bsnd', dirs_flat, R_c2w)
+        dirs_world = dirs_world.reshape(B, S, h, w, 3)
+
+        # World direction → spherical coordinates (OpenCV convention: Y-down)
+        x_w, y_w, z_w = dirs_world[..., 0], dirs_world[..., 1], dirs_world[..., 2]
+        theta = torch.atan2(x_w, z_w)                              # longitude ∈ [-π, π]
+        phi = torch.asin((-y_w).clamp(-1.0, 1.0))                  # latitude  ∈ [-π/2, π/2]
+
+        # Normalize to [-1, 1]
+        theta_norm = theta / torch.pi          # [-1, 1]
+        phi_norm = phi / (torch.pi / 2.0)      # [-1, 1]
+
+        # Stack as [B, S, 2, H, W]
+        spherical_maps = torch.stack([theta_norm, phi_norm], dim=2)
+
+        return spherical_maps
+
     def transform_camera_vector(self, camera_params, h, w):
         ext_mat, int_mat = vector_to_camera_matrices(
             camera_params, image_hw=(h, w)

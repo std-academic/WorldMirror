@@ -32,7 +32,7 @@ optimizer:
       lr: 2e-4
       weight_decay: 0.1
   pretrained_params: ['visual_geometry_transformer.patch_embed']
-  new_params: ['normal_head', 'gs_head', 'gs_renderer', 'depth_embed', 'rays_embed', 'camera_embed']
+  new_params: ['normal_head', 'gs_head', 'gs_renderer', 'depth_embed', 'ray_embed', 'spherical_ray_embed', 'camera_embed']
 
 scheduler:
   type: WarmupCosineAnnealingLR

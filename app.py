@@ -154,11 +154,11 @@ def run_model(
         print(f"  ✅ Generated {len(cubemap_views)} cubemap faces ({n_erp} ERPs × {group_sizes[0]} faces)")
 
         img, c2w_poses, K_intrs = cubemap_views_to_model_input(cubemap_views, device=device)
-        # Single ERP: full conditioning; Multi-ERP: intrinsics only
+        # Single ERP: full conditioning + spherical rays; Multi-ERP: intrinsics + spherical rays
         if n_erp == 1:
-            cond_flags = [1, 0, 1]
+            cond_flags = [1, 0, 1, 1]
         else:
-            cond_flags = [0, 0, 1]
+            cond_flags = [0, 0, 1, 1]
         print(f"  ✅ Camera conditioning: cond_flags={cond_flags}")
     else:
         img = load_and_preprocess_images(image_file_paths).to(device)
@@ -172,10 +172,8 @@ def run_model(
     inputs = {}
     inputs['img'] = img
     if is_erp_input:
-        if n_erp == 1:
-            # Single ERP: provide both poses and intrinsics
-            inputs['camera_poses'] = c2w_poses
-        # Always provide intrinsics for ERP inputs
+        # Always provide poses+intrinsics for ERP to enable spherical rays
+        inputs['camera_poses'] = c2w_poses
         inputs['camera_intrs'] = K_intrs
     use_amp = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     if use_amp:
